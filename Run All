@@ -1,0 +1,69 @@
+import sqlite3, os, base64, getpass
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+DB1, DB2, BACKUP = "database1.db", "database2.db", "database1_backup.bak"
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "ChangeMe#2026")   # use env var, never commit real passwords
+
+def key_from_password(pw, salt):
+    kdf = PBKDF2HMAC(hashes.SHA256(), 32, salt, 480_000)
+    return base64.urlsafe_b64encode(kdf.derive(pw.encode()))
+
+for f in (DB1, DB2, BACKUP, DB1 + ".enc"):
+    if os.path.exists(f): os.remove(f)
+
+# 1. Create 2 databases; Profile table in database 1
+c1 = sqlite3.connect(DB1); c2 = sqlite3.connect(DB2); c2.close()
+c1.execute("""CREATE TABLE Profile (
+  Profile_ID INTEGER PRIMARY KEY, Name TEXT, Address TEXT,
+  Age INTEGER, Department TEXT, Position TEXT)""")
+print("1. Created database1.db & database2.db; Profile table created in database1.db")
+
+# 2. Insert 5 rows (Profile_ID = PK)
+rows = [
+ (1,"Juan Dela Cruz","Makati City",30,"IT","Developer"),
+ (2,"Maria Santos","Quezon City",28,"HR","HR Officer"),
+ (3,"Jose Reyes","Pasig City",35,"Finance","Accountant"),
+ (4,"Ana Lim","Taguig City",26,"Marketing","Designer"),
+ (5,"Pedro Garcia","Manila",41,"Operations","Manager")]
+c1.executemany("INSERT INTO Profile VALUES (?,?,?,?,?,?)", rows); c1.commit()
+print("2. Inserted 5 rows:"); [print("  ", r) for r in c1.execute("SELECT * FROM Profile")]
+
+# 3. Backup database1, restore into database2
+bk = sqlite3.connect(BACKUP); c1.backup(bk); bk.close()
+c2 = sqlite3.connect(DB2); src = sqlite3.connect(BACKUP); src.backup(c2); src.close()
+print("3. Backup ->", BACKUP, "; restored into database2.db:",
+      c2.execute("SELECT COUNT(*) FROM Profile").fetchone()[0], "rows")
+c1.close()
+
+# 4. Encrypt database1 file with a password (PBKDF2 + AES via Fernet)
+salt = os.urandom(16)
+f = Fernet(key_from_password(DB_PASSWORD, salt))
+with open(DB1,"rb") as fh: blob = f.encrypt(fh.read())
+with open(DB1 + ".enc","wb") as fh: fh.write(salt + blob)
+os.remove(DB1)   # plaintext copy removed; only the encrypted file stays
+print("4. database1.db encrypted with password ->", DB1 + ".enc")
+
+# 5. Encrypt all data in database2's Profile table (field-level)
+col_key = Fernet.generate_key()
+open("column.key","wb").write(col_key)    # keep OFF GitHub (.gitignore)
+cf = Fernet(col_key)
+c2.execute("CREATE TABLE Profile_enc (Profile_ID INTEGER PRIMARY KEY, Name BLOB, Address BLOB, Age BLOB, Department BLOB, Position BLOB)")
+for r in c2.execute("SELECT * FROM Profile").fetchall():
+    c2.execute("INSERT INTO Profile_enc VALUES (?,?,?,?,?,?)",
+               (r[0], *[cf.encrypt(str(v).encode()) for v in r[1:]]))
+c2.execute("DROP TABLE Profile"); c2.execute("ALTER TABLE Profile_enc RENAME TO Profile")
+c2.commit(); c2.execute("VACUUM")
+print("5. All data in database2.Profile encrypted (Profile_ID kept as the PK)")
+
+# 6. Show decrypted data of 2nd and 3rd rows
+print("6. Decrypted rows 2 and 3:")
+for r in c2.execute("SELECT * FROM Profile WHERE Profile_ID IN (2,3)"):
+    print("  ", (r[0], *[cf.decrypt(v).decode() for v in r[1:]]))
+
+# 7. Show all encrypted data
+print("7. All encrypted data (database2.Profile):")
+for r in c2.execute("SELECT * FROM Profile"):
+    print("  ", (r[0], *[v[:28].decode()+"..." for v in r[1:]]))
+c2.close()
